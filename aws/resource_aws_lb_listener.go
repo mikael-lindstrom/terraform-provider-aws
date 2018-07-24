@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"strconv"
 	"strings"
 	"time"
 
@@ -84,27 +85,14 @@ func resourceAwsLbListener() *schema.Resource {
 							ValidateFunc: validation.IntBetween(1, 50000),
 						},
 						"authenticate_cognito_config": {
-							Type:     schema.TypeSet,
+							Type:     schema.TypeList,
 							Optional: true,
 							MaxItems: 1,
 							Elem: &schema.Resource{
 								Schema: map[string]*schema.Schema{
 									"authentication_request_extra_params": {
-										Type:     schema.TypeSet,
+										Type:     schema.TypeMap,
 										Optional: true,
-										MaxItems: 10,
-										Elem: &schema.Resource{
-											Schema: map[string]*schema.Schema{
-												"key": &schema.Schema{
-													Type:     schema.TypeString,
-													Required: true,
-												},
-												"value": &schema.Schema{
-													Type:     schema.TypeString,
-													Required: true,
-												},
-											},
-										},
 									},
 									"on_unauthenticated_request": {
 										Type:     schema.TypeString,
@@ -126,7 +114,7 @@ func resourceAwsLbListener() *schema.Resource {
 										Optional: true,
 										Computed: true,
 									},
-									"session_time_out": {
+									"session_timeout": {
 										Type:     schema.TypeInt,
 										Optional: true,
 										Computed: true,
@@ -147,27 +135,14 @@ func resourceAwsLbListener() *schema.Resource {
 							},
 						},
 						"authenticate_oidc_config": {
-							Type:     schema.TypeSet,
+							Type:     schema.TypeList,
 							Optional: true,
 							MaxItems: 1,
 							Elem: &schema.Resource{
 								Schema: map[string]*schema.Schema{
 									"authentication_request_extra_params": {
-										Type:     schema.TypeSet,
+										Type:     schema.TypeMap,
 										Optional: true,
-										MaxItems: 10,
-										Elem: &schema.Resource{
-											Schema: map[string]*schema.Schema{
-												"key": &schema.Schema{
-													Type:     schema.TypeString,
-													Required: true,
-												},
-												"value": &schema.Schema{
-													Type:     schema.TypeString,
-													Required: true,
-												},
-											},
-										},
 									},
 									"authorization_endpoint": {
 										Type:     schema.TypeString,
@@ -178,8 +153,9 @@ func resourceAwsLbListener() *schema.Resource {
 										Required: true,
 									},
 									"client_secret": {
-										Type:     schema.TypeString,
-										Required: true,
+										Type:      schema.TypeString,
+										Required:  true,
+										Sensitive: true,
 									},
 									"issuer": {
 										Type:     schema.TypeString,
@@ -205,7 +181,7 @@ func resourceAwsLbListener() *schema.Resource {
 										Optional: true,
 										Computed: true,
 									},
-									"session_time_out": {
+									"session_timeout": {
 										Type:     schema.TypeInt,
 										Optional: true,
 										Computed: true,
@@ -270,14 +246,12 @@ func resourceAwsLbListenerCreate(d *schema.ResourceData, meta interface{}) error
 					action.TargetGroupArn = aws.String(v)
 				}
 			case elbv2.ActionTypeEnumAuthenticateOidc:
-				cfgs := defaultActionMap["authenticate_oidc_config"].(*schema.Set).List()
-				if len(cfgs) > 0 {
-					action.AuthenticateOidcConfig = expandELbAuthenticateOidcActionConfig(cfgs[0].(map[string]interface{}))
+				if v, ok := defaultActionMap["authenticate_oidc_config"].([]interface{}); ok {
+					action.AuthenticateOidcConfig = expandELbAuthenticateOidcActionConfig(v[0].(map[string]interface{}))
 				}
 			case elbv2.ActionTypeEnumAuthenticateCognito:
-				cfgs := defaultActionMap["authenticate_cognito_config"].(*schema.Set).List()
-				if len(cfgs) > 0 {
-					action.AuthenticateCognitoConfig = expandELbAuthenticateCognitoActionConfig(cfgs[0].(map[string]interface{}))
+				if v, ok := defaultActionMap["authenticate_cognito_config"].([]interface{}); ok {
+					action.AuthenticateCognitoConfig = expandELbAuthenticateCognitoActionConfig(v[0].(map[string]interface{}))
 				}
 			}
 
@@ -344,11 +318,47 @@ func resourceAwsLbListenerRead(d *schema.ResourceData, meta interface{}) error {
 		d.Set("certificate_arn", listener.Certificates[0].CertificateArn)
 	}
 
-	if err := d.Set("default_action", flattenElbActions(listener.DefaultActions)); err != nil {
+	sortedActions := sortActionsBasedonTypeinTFFile(listener.DefaultActions, d)
+	flattenElbActions := make([]interface{}, 0, len(sortedActions))
+	for i, action := range sortedActions {
+		m := make(map[string]interface{})
+		if action.Order != nil {
+			m["order"] = int(aws.Int64Value(action.Order))
+		}
+		actionType := aws.StringValue(action.Type)
+		m["type"] = actionType
+
+		switch actionType {
+		case elbv2.ActionTypeEnumForward:
+			m["target_group_arn"] = aws.StringValue(action.TargetGroupArn)
+		case elbv2.ActionTypeEnumAuthenticateOidc:
+			// Since the client_secret is never returned from the API ignore it and use whats already in the state
+			client_secret := d.Get("default_action." + strconv.Itoa(i) + ".authenticate_oidc_config.0.client_secret").(string)
+			m["authenticate_oidc_config"] = flattenELbAuthenticateOidcActionConfig(action.AuthenticateOidcConfig, client_secret)
+		case elbv2.ActionTypeEnumAuthenticateCognito:
+			m["authenticate_cognito_config"] = flattenELbAuthenticateCognitoActionConfig(action.AuthenticateCognitoConfig)
+		}
+		flattenElbActions = append(flattenElbActions, m)
+	}
+
+	if err := d.Set("default_action", flattenElbActions); err != nil {
 		return err
 	}
 
 	return nil
+}
+
+func sortActionsBasedonTypeinTFFile(actions []*elbv2.Action, d *schema.ResourceData) []*elbv2.Action {
+	actionCount := d.Get("default_action.#").(int)
+	for i := 0; i < actionCount; i++ {
+		currAction := d.Get("default_action." + strconv.Itoa(i)).(map[string]interface{})
+		for j, action := range actions {
+			if currAction["type"].(string) == aws.StringValue(action.Type) {
+				actions[i], actions[j] = actions[j], actions[i]
+			}
+		}
+	}
+	return actions
 }
 
 func resourceAwsLbListenerUpdate(d *schema.ResourceData, meta interface{}) error {
@@ -391,14 +401,12 @@ func resourceAwsLbListenerUpdate(d *schema.ResourceData, meta interface{}) error
 					action.TargetGroupArn = aws.String(v)
 				}
 			case elbv2.ActionTypeEnumAuthenticateOidc:
-				cfgs := defaultActionMap["authenticate_oidc_config"].(*schema.Set).List()
-				if len(cfgs) > 0 {
-					action.AuthenticateOidcConfig = expandELbAuthenticateOidcActionConfig(cfgs[0].(map[string]interface{}))
+				if v, ok := defaultActionMap["authenticate_oidc_config"].([]interface{}); ok {
+					action.AuthenticateOidcConfig = expandELbAuthenticateOidcActionConfig(v[0].(map[string]interface{}))
 				}
 			case elbv2.ActionTypeEnumAuthenticateCognito:
-				cfgs := defaultActionMap["authenticate_cognito_config"].(*schema.Set).List()
-				if len(cfgs) > 0 {
-					action.AuthenticateCognitoConfig = expandELbAuthenticateCognitoActionConfig(cfgs[0].(map[string]interface{}))
+				if v, ok := defaultActionMap["authenticate_cognito_config"].([]interface{}); ok {
+					action.AuthenticateCognitoConfig = expandELbAuthenticateCognitoActionConfig(v[0].(map[string]interface{}))
 				}
 			}
 
@@ -463,13 +471,12 @@ func expandELbAuthenticateCognitoActionConfig(cfg map[string]interface{}) *elbv2
 	}
 
 	if v, ok := cfg["authentication_request_extra_params"]; ok {
-		params := v.(*schema.Set).List()
-		arep := make(map[string]*string, len(params))
-		for _, param := range params {
-			p := param.(map[string]interface{})
-			arep[p["key"].(string)] = aws.String(p["value"].(string))
+		params := make(map[string]*string)
+
+		for key, value := range v.(map[string]interface{}) {
+			params[key] = aws.String(value.(string))
 		}
-		result.AuthenticationRequestExtraParams = arep
+		result.AuthenticationRequestExtraParams = params
 	}
 	if v, ok := cfg["on_unauthenticated_request"].(string); ok && v != "" {
 		result.OnUnauthenticatedRequest = aws.String(v)
@@ -501,13 +508,12 @@ func expandELbAuthenticateOidcActionConfig(cfg map[string]interface{}) *elbv2.Au
 	}
 
 	if v, ok := cfg["authentication_request_extra_params"]; ok {
-		params := v.(*schema.Set).List()
-		arep := make(map[string]*string, len(params))
-		for _, param := range params {
-			p := param.(map[string]interface{})
-			arep[p["key"].(string)] = aws.String(p["value"].(string))
+		params := make(map[string]*string)
+
+		for key, value := range v.(map[string]interface{}) {
+			params[key] = aws.String(value.(string))
 		}
-		result.AuthenticationRequestExtraParams = arep
+		result.AuthenticationRequestExtraParams = params
 	}
 	if v, ok := cfg["on_unauthenticated_request"].(string); ok && v != "" {
 		result.OnUnauthenticatedRequest = aws.String(v)
@@ -525,34 +531,7 @@ func expandELbAuthenticateOidcActionConfig(cfg map[string]interface{}) *elbv2.Au
 	return result
 }
 
-func flattenElbActions(actions []*elbv2.Action) []map[string]interface{} {
-	if len(actions) == 0 {
-		return nil
-	}
-	result := make([]map[string]interface{}, 0, len(actions))
-	for _, action := range actions {
-		m := make(map[string]interface{})
-		if action.Order != nil {
-			m["order"] = int(aws.Int64Value(action.Order))
-		}
-		actionType := aws.StringValue(action.Type)
-		m["type"] = actionType
-
-		switch actionType {
-		case elbv2.ActionTypeEnumForward:
-			m["target_group_arn"] = aws.StringValue(action.TargetGroupArn)
-		case elbv2.ActionTypeEnumAuthenticateOidc:
-			m["authenticate_oidc_config"] = flattenELbAuthenticateOidcActionConfig(action.AuthenticateOidcConfig)
-		case elbv2.ActionTypeEnumAuthenticateCognito:
-			m["authenticate_cognito_config"] = flattenELbAuthenticateCognitoActionConfig(action.AuthenticateCognitoConfig)
-		}
-		result = append(result, m)
-	}
-
-	return result
-}
-
-func flattenELbAuthenticateOidcActionConfig(cfg *elbv2.AuthenticateOidcActionConfig) []map[string]interface{} {
+func flattenELbAuthenticateOidcActionConfig(cfg *elbv2.AuthenticateOidcActionConfig, client_secret string) []map[string]interface{} {
 	if cfg == nil {
 		return nil
 	}
@@ -560,7 +539,7 @@ func flattenELbAuthenticateOidcActionConfig(cfg *elbv2.AuthenticateOidcActionCon
 
 	m["authorization_endpoint"] = aws.StringValue(cfg.AuthorizationEndpoint)
 	m["client_id"] = aws.StringValue(cfg.ClientId)
-	m["client_secret"] = aws.StringValue(cfg.ClientSecret)
+	m["client_secret"] = client_secret
 	m["issuer"] = aws.StringValue(cfg.Issuer)
 	m["on_unauthenticated_request"] = aws.StringValue(cfg.OnUnauthenticatedRequest)
 	m["scope"] = aws.StringValue(cfg.Scope)
@@ -570,13 +549,9 @@ func flattenELbAuthenticateOidcActionConfig(cfg *elbv2.AuthenticateOidcActionCon
 	m["user_info_endpoint"] = aws.StringValue(cfg.UserInfoEndpoint)
 
 	if len(cfg.AuthenticationRequestExtraParams) > 0 {
-		params := make([]map[string]interface{}, 0, len(cfg.AuthenticationRequestExtraParams))
+		params := make(map[string]interface{})
 		for k, v := range cfg.AuthenticationRequestExtraParams {
-			param := map[string]interface{}{
-				"key":   k,
-				"value": aws.StringValue(v),
-			}
-			params = append(params, param)
+			params[k] = aws.StringValue(v)
 		}
 		m["authentication_request_extra_params"] = params
 	}
@@ -599,13 +574,9 @@ func flattenELbAuthenticateCognitoActionConfig(cfg *elbv2.AuthenticateCognitoAct
 	m["user_pool_domain"] = aws.StringValue(cfg.UserPoolDomain)
 
 	if len(cfg.AuthenticationRequestExtraParams) > 0 {
-		params := make([]map[string]interface{}, 0, len(cfg.AuthenticationRequestExtraParams))
+		params := make(map[string]interface{})
 		for k, v := range cfg.AuthenticationRequestExtraParams {
-			param := map[string]interface{}{
-				"key":   k,
-				"value": aws.StringValue(v),
-			}
-			params = append(params, param)
+			params[k] = aws.StringValue(v)
 		}
 		m["authentication_request_extra_params"] = params
 	}
