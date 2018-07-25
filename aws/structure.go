@@ -28,6 +28,7 @@ import (
 	"github.com/aws/aws-sdk-go/service/elasticbeanstalk"
 	elasticsearch "github.com/aws/aws-sdk-go/service/elasticsearchservice"
 	"github.com/aws/aws-sdk-go/service/elb"
+	"github.com/aws/aws-sdk-go/service/elbv2"
 	"github.com/aws/aws-sdk-go/service/iot"
 	"github.com/aws/aws-sdk-go/service/kinesis"
 	"github.com/aws/aws-sdk-go/service/lambda"
@@ -4141,4 +4142,141 @@ func expandVpcPeeringConnectionOptions(m map[string]interface{}) *ec2.PeeringCon
 	}
 
 	return options
+}
+
+func sortActionsBasedonTypeinTFFile(actionName string, actions []*elbv2.Action, d *schema.ResourceData) []*elbv2.Action {
+	actionCount := d.Get(actionName + ".#").(int)
+	for i := 0; i < actionCount; i++ {
+		currAction := d.Get(actionName + "." + strconv.Itoa(i)).(map[string]interface{})
+		for j, action := range actions {
+			if currAction["type"].(string) == aws.StringValue(action.Type) {
+				actions[i], actions[j] = actions[j], actions[i]
+			}
+		}
+	}
+	return actions
+}
+
+func expandELbAuthenticateCognitoActionConfig(cfg map[string]interface{}) *elbv2.AuthenticateCognitoActionConfig {
+	if len(cfg) == 0 {
+		return nil
+	}
+	result := &elbv2.AuthenticateCognitoActionConfig{
+		UserPoolArn:      aws.String(cfg["user_pool_arn"].(string)),
+		UserPoolClientId: aws.String(cfg["user_pool_client"].(string)),
+		UserPoolDomain:   aws.String(cfg["user_pool_domain"].(string)),
+	}
+
+	if v, ok := cfg["authentication_request_extra_params"]; ok {
+		params := make(map[string]*string)
+
+		for key, value := range v.(map[string]interface{}) {
+			params[key] = aws.String(value.(string))
+		}
+		result.AuthenticationRequestExtraParams = params
+	}
+	if v, ok := cfg["on_unauthenticated_request"].(string); ok && v != "" {
+		result.OnUnauthenticatedRequest = aws.String(v)
+	}
+	if v, ok := cfg["scope"].(string); ok && v != "" {
+		result.Scope = aws.String(v)
+	}
+	if v, ok := cfg["session_cookie_name"].(string); ok && v != "" {
+		result.SessionCookieName = aws.String(v)
+	}
+	if v, ok := cfg["session_timeout"].(int); ok && v != 0 {
+		result.SessionTimeout = aws.Int64(int64(v))
+	}
+
+	return result
+}
+
+func expandELbAuthenticateOidcActionConfig(cfg map[string]interface{}) *elbv2.AuthenticateOidcActionConfig {
+	if len(cfg) == 0 {
+		return nil
+	}
+	result := &elbv2.AuthenticateOidcActionConfig{
+		AuthorizationEndpoint: aws.String(cfg["authorization_endpoint"].(string)),
+		ClientId:              aws.String(cfg["client_id"].(string)),
+		ClientSecret:          aws.String(cfg["client_secret"].(string)),
+		Issuer:                aws.String(cfg["issuer"].(string)),
+		TokenEndpoint:         aws.String(cfg["token_endpoint"].(string)),
+		UserInfoEndpoint:      aws.String(cfg["user_info_endpoint"].(string)),
+	}
+
+	if v, ok := cfg["authentication_request_extra_params"]; ok {
+		params := make(map[string]*string)
+
+		for key, value := range v.(map[string]interface{}) {
+			params[key] = aws.String(value.(string))
+		}
+		result.AuthenticationRequestExtraParams = params
+	}
+	if v, ok := cfg["on_unauthenticated_request"].(string); ok && v != "" {
+		result.OnUnauthenticatedRequest = aws.String(v)
+	}
+	if v, ok := cfg["scope"].(string); ok && v != "" {
+		result.Scope = aws.String(v)
+	}
+	if v, ok := cfg["session_cookie_name"].(string); ok && v != "" {
+		result.SessionCookieName = aws.String(v)
+	}
+	if v, ok := cfg["session_timeout"].(int); ok && v != 0 {
+		result.SessionTimeout = aws.Int64(int64(v))
+	}
+
+	return result
+}
+
+func flattenELbAuthenticateOidcActionConfig(cfg *elbv2.AuthenticateOidcActionConfig, client_secret string) []map[string]interface{} {
+	if cfg == nil {
+		return nil
+	}
+	m := make(map[string]interface{})
+
+	m["authorization_endpoint"] = aws.StringValue(cfg.AuthorizationEndpoint)
+	m["client_id"] = aws.StringValue(cfg.ClientId)
+	m["client_secret"] = client_secret
+	m["issuer"] = aws.StringValue(cfg.Issuer)
+	m["on_unauthenticated_request"] = aws.StringValue(cfg.OnUnauthenticatedRequest)
+	m["scope"] = aws.StringValue(cfg.Scope)
+	m["session_cookie_name"] = aws.StringValue(cfg.SessionCookieName)
+	m["session_timeout"] = aws.Int64Value(cfg.SessionTimeout)
+	m["token_endpoint"] = aws.StringValue(cfg.TokenEndpoint)
+	m["user_info_endpoint"] = aws.StringValue(cfg.UserInfoEndpoint)
+
+	if len(cfg.AuthenticationRequestExtraParams) > 0 {
+		params := make(map[string]interface{})
+		for k, v := range cfg.AuthenticationRequestExtraParams {
+			params[k] = aws.StringValue(v)
+		}
+		m["authentication_request_extra_params"] = params
+	}
+
+	return []map[string]interface{}{m}
+}
+
+func flattenELbAuthenticateCognitoActionConfig(cfg *elbv2.AuthenticateCognitoActionConfig) []map[string]interface{} {
+	if cfg == nil {
+		return nil
+	}
+	m := make(map[string]interface{})
+
+	m["on_unauthenticated_request"] = aws.StringValue(cfg.OnUnauthenticatedRequest)
+	m["scope"] = aws.StringValue(cfg.Scope)
+	m["session_cookie_name"] = aws.StringValue(cfg.SessionCookieName)
+	m["session_timeout"] = aws.Int64Value(cfg.SessionTimeout)
+	m["user_pool_arn"] = aws.StringValue(cfg.UserPoolArn)
+	m["user_pool_client"] = aws.StringValue(cfg.UserPoolClientId)
+	m["user_pool_domain"] = aws.StringValue(cfg.UserPoolDomain)
+
+	if len(cfg.AuthenticationRequestExtraParams) > 0 {
+		params := make(map[string]interface{})
+		for k, v := range cfg.AuthenticationRequestExtraParams {
+			params[k] = aws.StringValue(v)
+		}
+		m["authentication_request_extra_params"] = params
+	}
+
+	return []map[string]interface{}{m}
 }
